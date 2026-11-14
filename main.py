@@ -4,6 +4,9 @@ import inspect
 import json
 import os
 import time
+import glob
+import shutil
+import subprocess
 from os import environ
 
 import pyrogram
@@ -552,7 +555,105 @@ async def handle_private(message, chatid, msgid):
             "caption_entities": msg.caption_entities,
         }
 
-        if msg_type == "Document":
+        # Oversized videos: split with FFmpeg stream-copy (no re-encoding).
+        # FFmpeg must be installed in the Heroku dyno separately.
+        if msg_type == "Video" and os.path.getsize(downloaded_file) > 1900 * 1024 * 1024:
+            if not shutil.which("ffmpeg"):
+                raise RuntimeError(
+                    "This video exceeds Telegram's 2 GB upload limit, but FFmpeg "
+                    "is not installed. Install FFmpeg in the Heroku dyno first."
+                )
+
+            source_size = os.path.getsize(downloaded_file)
+            source_duration = max(1, int(msg.video.duration or 1))
+            segment_seconds = max(
+                1, int(source_duration * (1700 * 1024 * 1024) / source_size * 0.80)
+            )
+            segment_pattern = f"{downloaded_file}.segment_%03d.mp4"
+            segments = []
+
+            for attempt in range(8):
+                for old_segment in glob.glob(f"{downloaded_file}.segment_*.mp4"):
+                    try:
+                        os.remove(old_segment)
+                    except OSError:
+                        pass
+
+                command = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", downloaded_file,
+                    "-map", "0:v:0", "-map", "0:a?",
+                    "-c", "copy",
+                    "-f", "segment",
+                    "-segment_time", str(segment_seconds),
+                    "-reset_timestamps", "1",
+                    "-segment_format", "mp4",
+                    "-segment_format_options", "movflags=+faststart",
+                    segment_pattern,
+                ]
+                result = subprocess.run(
+                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                segments = sorted(glob.glob(f"{downloaded_file}.segment_*.mp4"))
+
+                if result.returncode != 0 or not segments:
+                    raise RuntimeError(
+                        "FFmpeg could not split this video: "
+                        + (result.stderr[-1000:] or "No video segments were created.")
+                    )
+
+                if all(os.path.getsize(part) <= 1900 * 1024 * 1024 for part in segments):
+                    break
+
+                segment_seconds = max(1, int(segment_seconds * 0.65))
+            else:
+                raise RuntimeError(
+                    "FFmpeg could not make every video segment smaller than 1900 MiB."
+                )
+
+            try:
+                total_parts = len(segments)
+                for part_number, part_path in enumerate(segments, start=1):
+                    part_duration = max(1, int(source_duration / total_parts))
+                    part_caption = (
+                        f"{msg.caption or ''}\\n\\n📹 Part {part_number}/{total_parts}"
+                    ).strip()
+
+                    sent_part = await safe_call(
+                        bot.send_video,
+                        message.chat.id,
+                        part_path,
+                        caption=part_caption,
+                        duration=part_duration,
+                        width=msg.video.width,
+                        height=msg.video.height,
+                        supports_streaming=True,
+                        progress=progress,
+                        progress_args=[status_message, "up"],
+                        reply_to_message_id=message.id,
+                    )
+
+                    if sent_part and AUTO_UPLOAD:
+                        target = _target_id()
+                        if target is not None and target != message.chat.id:
+                            await safe_call(
+                                bot.copy_message,
+                                target,
+                                sent_part.chat.id,
+                                sent_part.id,
+                            )
+            finally:
+                for part_path in segments:
+                    try:
+                        if os.path.exists(part_path):
+                            os.remove(part_path)
+                    except OSError as error:
+                        print(f"Could not remove video segment {part_path}: {error!r}")
+
+            sent = None
+            print(f"Uploaded oversized video as {len(segments)} playable video parts.")
+
+        elif msg_type == "Document":
             try:
                 if msg.document.thumbs:
                     thumb = await safe_read_call(
