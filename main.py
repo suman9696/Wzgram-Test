@@ -163,8 +163,8 @@ async def _stream_upload_as_document_parts(
 
         part_name = os.path.basename(part_path)
         part_caption = (
-            f"{caption}\\n\\n" if caption else ""
-        ) + f"📦 {part_name}\\nPart {part_number}/{part_count}"
+            f"{caption}\n\n" if caption else ""
+        ) + f"📦 {part_name}\nPart {part_number}/{part_count}"
 
         sent = await safe_call(
             bot.send_document,
@@ -185,39 +185,105 @@ async def _stream_upload_as_document_parts(
         os.remove(part_path)
         part_path = None
 
+    # WZGram stream_media(offset=...) resumes at a chunk offset. Keep the
+    # chunk counter separate from byte counts so a dropped connection can
+    # continue without downloading already-written data again.
+    chunk_offset = 0
+    retry_count = 0
+    max_stream_retries = 10
+
     try:
-        async for chunk in acc.stream_media(source_message):
-            view = memoryview(chunk)
-            while view:
-                if part_path is None:
-                    part_name = f"{original_name}.part{part_number:03d}"
-                    part_path = os.path.join("/tmp", part_name)
-                    await safe_call(
-                        bot.edit_message_text,
-                        status_message.chat.id,
-                        status_message.id,
-                        f"📥 **DOWNLOADING PART {part_number}/{part_count}**\\n"
-                        f"Preparing downloadable document part…",
+        while bytes_received < file_size:
+            stream = acc.stream_media(source_message, offset=chunk_offset)
+            iterator = aiter(stream)
+            got_chunk = False
+            interrupted = False
+
+            while True:
+                try:
+                    chunk = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                except Exception as error:
+                    error_name = type(error).__name__.lower()
+                    is_flood = "floodwait" in error_name or "floodpremiumwait" in error_name
+                    if not is_flood and not _is_connection_error(error):
+                        raise
+                    if retry_count >= max_stream_retries:
+                        raise RuntimeError(
+                            f"Media stream failed after {max_stream_retries} resume attempts: {error!r}"
+                        ) from error
+                    retry_count += 1
+                    interrupted = True
+                    if is_flood:
+                        delay = max(1, _flood_wait_seconds(error) + 1)
+                    else:
+                        delay = min(2 ** retry_count, 30)
+                    print(
+                        f"Media stream interrupted at chunk {chunk_offset}; "
+                        f"resuming in {delay}s ({retry_count}/{max_stream_retries}): {error!r}"
+                    )
+                    await asyncio.sleep(delay)
+                    break
+
+                got_chunk = True
+                view = memoryview(chunk)
+                while view:
+                    if part_path is None:
+                        part_name = f"{original_name}.part{part_number:03d}"
+                        part_path = os.path.join("/tmp", part_name)
+                        await safe_call(
+                            bot.edit_message_text,
+                            status_message.chat.id,
+                            status_message.id,
+                            f"📥 **DOWNLOADING PART {part_number}/{part_count}**\n"
+                            f"Preparing downloadable document part…",
+                        )
+
+                    available = part_limit - part_size
+                    piece = view[:available]
+                    with open(part_path, "ab") as part_file:
+                        part_file.write(piece)
+                    written = len(piece)
+                    part_size += written
+                    bytes_received += written
+                    view = view[written:]
+
+                    await progress(
+                        bytes_received, file_size, status_message, "down"
                     )
 
-                available = part_limit - part_size
-                piece = view[:available]
-                with open(part_path, "ab") as part_file:
-                    part_file.write(piece)
-                written = len(piece)
-                part_size += written
-                bytes_received += written
-                view = view[written:]
+                    if part_size >= part_limit:
+                        await upload_current_part()
+                        part_number += 1
+                        part_size = 0
 
-                # Reuse the existing progress display while streaming the source.
-                await progress(
-                    bytes_received, file_size, status_message, "down"
+                # Increment only after this chunk has been fully written.
+                chunk_offset += 1
+                retry_count = 0
+
+            if bytes_received >= file_size:
+                break
+            if interrupted:
+                # The exception handler already applied the retry delay.
+                continue
+
+            # A clean end before the advertised size is also treated as a
+            # temporary interruption. Resume from the next unread chunk.
+            if not got_chunk or bytes_received < file_size:
+                if retry_count >= max_stream_retries:
+                    raise IOError(
+                        f"Telegram stream stopped early after {bytes_received} "
+                        f"of {file_size} bytes and {max_stream_retries} retries."
+                    )
+                retry_count += 1
+                delay = min(2 ** retry_count, 30)
+                print(
+                    f"Telegram stream ended at {bytes_received}/{file_size} bytes; "
+                    f"resuming from chunk {chunk_offset} in {delay}s "
+                    f"({retry_count}/{max_stream_retries})."
                 )
-
-                if part_size >= part_limit:
-                    await upload_current_part()
-                    part_number += 1
-                    part_size = 0
+                await asyncio.sleep(delay)
 
         if part_size:
             await upload_current_part()
