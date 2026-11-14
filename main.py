@@ -1,8 +1,10 @@
 # WZGram is async-only: every Telegram API call must be awaited.
 import asyncio
 import inspect
+import math
 import json
 import os
+import shutil
 import time
 from os import environ
 
@@ -120,6 +122,112 @@ OWNER_ID = int(environ.get("OWNER_ID", "0"))
 TARGET_CHAT_ID = environ.get("TARGET_CHAT_ID", "").strip()
 AUTO_UPLOAD = True
 TARGET_CONFIG_FILE = "target_config.json"
+
+# Keep parts well below Telegram's 2,000 MiB standard-account ceiling.
+# Smaller parts also reduce temporary-disk pressure on Heroku dynos.
+SPLIT_PART_SIZE = 900 * 1024 * 1024
+
+
+async def _stream_upload_as_document_parts(
+    message, source_message, status_message, caption, media
+):
+    """Stream an oversized Telegram file into uploadable document parts."""
+    file_size = int(getattr(media, "file_size", 0) or 0)
+    if file_size <= SPLIT_PART_SIZE:
+        raise ValueError("Stream splitter called for a file below the part-size limit.")
+
+    original_name = os.path.basename(
+        getattr(media, "file_name", None) or f"telegram_{source_message.id}.bin"
+    )
+    target = _target_id() if AUTO_UPLOAD else None
+    part_number = 1
+    part_size = 0
+    bytes_received = 0
+    part_path = None
+
+    # Only one part is stored at a time; the full original is never downloaded.
+    # Adapt the part size to the actual free space on the Heroku dyno.
+    free_space = shutil.disk_usage("/tmp").free
+    part_limit = min(SPLIT_PART_SIZE, free_space - (32 * 1024 * 1024))
+    if part_limit < 64 * 1024 * 1024:
+        raise RuntimeError(
+            "Not enough temporary disk space to create even a 64 MiB split part. "
+            f"Free space in /tmp: {free_space / (1024 ** 2):.1f} MiB."
+        )
+    part_count = math.ceil(file_size / part_limit)
+
+    async def upload_current_part():
+        nonlocal part_path
+        if not part_path or part_size <= 0:
+            return
+
+        part_name = os.path.basename(part_path)
+        part_caption = (
+            f"{caption}\\n\\n" if caption else ""
+        ) + f"📦 {part_name}\\nPart {part_number}/{part_count}"
+
+        sent = await safe_call(
+            bot.send_document,
+            message.chat.id,
+            part_path,
+            caption=part_caption[:1024],
+            progress=progress,
+            progress_args=[status_message, "up"],
+            reply_to_message_id=message.id,
+        )
+        if sent and target is not None and target != message.chat.id:
+            await safe_call(bot.copy_message, target, sent.chat.id, sent.id)
+
+        print(
+            f"Uploaded split part {part_number}/{part_count} "
+            f"({part_size / (1024 ** 2):.1f} MiB): {part_name}"
+        )
+        os.remove(part_path)
+        part_path = None
+
+    try:
+        async for chunk in acc.stream_media(source_message):
+            view = memoryview(chunk)
+            while view:
+                if part_path is None:
+                    part_name = f"{original_name}.part{part_number:03d}"
+                    part_path = os.path.join("/tmp", part_name)
+                    await safe_call(
+                        bot.edit_message_text,
+                        status_message.chat.id,
+                        status_message.id,
+                        f"📥 **Preparing part {part_number}/{part_count}**",
+                    )
+
+                available = part_limit - part_size
+                piece = view[:available]
+                with open(part_path, "ab") as part_file:
+                    part_file.write(piece)
+                written = len(piece)
+                part_size += written
+                bytes_received += written
+                view = view[written:]
+
+                if part_size >= SPLIT_PART_SIZE:
+                    await upload_current_part()
+                    part_number += 1
+                    part_size = 0
+
+        if part_size:
+            await upload_current_part()
+
+        if bytes_received != file_size:
+            raise IOError(
+                f"Telegram stream ended early: received {bytes_received} "
+                f"of {file_size} bytes."
+            )
+
+    finally:
+        try:
+            if part_path and os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError as error:
+            print(f"Could not remove temporary split part: {error!r}")
 
 
 def _load_target_config():
@@ -529,6 +637,18 @@ async def handle_private(message, chatid, msgid):
     thumb = None
 
     try:
+        media_obj = getattr(msg, msg_type.lower(), None)
+        media_size = int(getattr(media_obj, "file_size", 0) or 0)
+        if (
+            msg_type in ("Document", "Video")
+            and media_obj is not None
+            and media_size > SPLIT_PART_SIZE
+        ):
+            await _stream_upload_as_document_parts(
+                message, msg, status_message, msg.caption or "", media_obj
+            )
+            return
+
         try:
             downloaded_file = await safe_read_call(
                 acc.download_media,
