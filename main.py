@@ -125,7 +125,7 @@ TARGET_CONFIG_FILE = "target_config.json"
 
 # Keep parts well below Telegram's 2,000 MiB standard-account ceiling.
 # Smaller parts also reduce temporary-disk pressure on Heroku dynos.
-SPLIT_PART_SIZE = 900 * 1024 * 1024
+SPLIT_PART_SIZE = 1900 * 1024 * 1024
 
 
 async def _stream_upload_as_document_parts(
@@ -196,7 +196,8 @@ async def _stream_upload_as_document_parts(
                         bot.edit_message_text,
                         status_message.chat.id,
                         status_message.id,
-                        f"📥 **Preparing part {part_number}/{part_count}**",
+                        f"📥 **DOWNLOADING PART {part_number}/{part_count}**\\n"
+                        f"Preparing downloadable document part…",
                     )
 
                 available = part_limit - part_size
@@ -208,7 +209,12 @@ async def _stream_upload_as_document_parts(
                 bytes_received += written
                 view = view[written:]
 
-                if part_size >= SPLIT_PART_SIZE:
+                # Reuse the existing progress display while streaming the source.
+                await progress(
+                    bytes_received, file_size, status_message, "down"
+                )
+
+                if part_size >= part_limit:
                     await upload_current_part()
                     part_number += 1
                     part_size = 0
