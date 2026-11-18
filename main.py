@@ -431,20 +431,55 @@ USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 
 
 @bot.on_message(filters.command(["start"]))
 async def send_start(client, message):
+    """Show a short animated intro, then reveal the full welcome screen."""
     mention = message.from_user.mention if message.from_user else "there"
-    await safe_call(
+
+    # Telegram has no CSS-style page transitions, so animate one message
+    # with a few lightweight edits instead of sending multiple messages.
+    intro = await safe_call(
         bot.send_message,
         message.chat.id,
-        f"**♻️ 𝙷𝚒** **{mention}**, "
-        f"**𝐈 𝐚𝐦 𝐒𝐚𝐯𝐞 𝐑𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐁𝐨𝐭, 𝐈 𝐜𝐚𝐧 𝐬𝐞𝐧𝐝 𝐲𝐨𝐮 "
-        f"𝐫𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐜𝐨𝐧𝐭𝐞𝐧𝐭 𝐛𝐲 𝐢𝐭'𝐬 𝐩𝐨𝐬𝐭 𝐥𝐢𝐧𝐤**\n\n{USAGE}",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫",
-                url="tg://openmessage?user_id=7771180127",
-            )
-        ]]),
+        "<b>✨ WZGram</b>\n<code>▰▱▱▱▱▱▱▱▱▱</code>  <i>Starting...</i>",
         reply_to_message_id=message.id,
+    )
+
+    transition_frames = (
+        "<b>✨ WZGram</b>\n<code>▰▰▱▱▱▱▱▱▱▱</code>  <i>Initializing...</i>",
+        "<b>⚡ WZGram</b>\n<code>▰▰▰▰▰▱▱▱▱▱</code>  <i>Preparing services...</i>",
+        "<b>🚀 WZGram</b>\n<code>▰▰▰▰▰▰▰▰▰▰</code>  <i>Ready!</i>",
+    )
+    for frame in transition_frames:
+        await asyncio.sleep(0.35)
+        try:
+            await safe_call(
+                bot.edit_message_text,
+                intro.chat.id,
+                intro.id,
+                frame,
+            )
+        except Exception as error:
+            # A missed animation frame should never prevent the bot opening.
+            print(f"Welcome transition edit skipped: {error!r}")
+            break
+
+    welcome_text = (
+        f"<b>♻️ 𝙷𝚒 {mention}!</b>\n\n"
+        "<b>𝐖𝐞𝐥𝐜𝐨𝐦𝐞 𝐭𝐨 𝐖𝐙𝐆𝐫𝐚𝐦</b>\n"
+        "<i>Your smart restricted-content saver.</i>\n\n"
+        f"{USAGE}"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫",
+            url="tg://openmessage?user_id=7771180127",
+        )
+    ]])
+    await safe_call(
+        bot.edit_message_text,
+        intro.chat.id,
+        intro.id,
+        welcome_text,
+        reply_markup=keyboard,
     )
 
 
