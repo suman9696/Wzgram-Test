@@ -1,10 +1,8 @@
 # WZGram is async-only: every Telegram API call must be awaited.
 import asyncio
 import inspect
-import math
 import json
 import os
-import shutil
 import time
 from os import environ
 
@@ -17,6 +15,15 @@ from pyrogram.errors import (
     FloodWait,
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+# Cancellation flags keyed by the original request message.
+_cancel_flags = {}
+
+
+class JobCancelled(Exception):
+    """Raised when the owner cancels a transfer."""
+
 
 
 def _flood_wait_seconds(error):
@@ -123,184 +130,6 @@ TARGET_CHAT_ID = environ.get("TARGET_CHAT_ID", "").strip()
 AUTO_UPLOAD = True
 TARGET_CONFIG_FILE = "target_config.json"
 
-# Keep parts well below Telegram's 2,000 MiB standard-account ceiling.
-# Smaller parts also reduce temporary-disk pressure on Heroku dynos.
-SPLIT_PART_SIZE = 1900 * 1024 * 1024
-
-
-async def _stream_upload_as_document_parts(
-    message, source_message, status_message, caption, media
-):
-    """Stream an oversized Telegram file into uploadable document parts."""
-    file_size = int(getattr(media, "file_size", 0) or 0)
-    if file_size <= SPLIT_PART_SIZE:
-        raise ValueError("Stream splitter called for a file below the part-size limit.")
-
-    original_name = os.path.basename(
-        getattr(media, "file_name", None) or f"telegram_{source_message.id}.bin"
-    )
-    target = _target_id() if AUTO_UPLOAD else None
-    part_number = 1
-    part_size = 0
-    bytes_received = 0
-    part_path = None
-
-    # Only one part is stored at a time; the full original is never downloaded.
-    # Adapt the part size to the actual free space on the Heroku dyno.
-    free_space = shutil.disk_usage("/tmp").free
-    part_limit = min(SPLIT_PART_SIZE, free_space - (32 * 1024 * 1024))
-    if part_limit < 64 * 1024 * 1024:
-        raise RuntimeError(
-            "Not enough temporary disk space to create even a 64 MiB split part. "
-            f"Free space in /tmp: {free_space / (1024 ** 2):.1f} MiB."
-        )
-    part_count = math.ceil(file_size / part_limit)
-
-    async def upload_current_part():
-        nonlocal part_path
-        if not part_path or part_size <= 0:
-            return
-
-        part_name = os.path.basename(part_path)
-        part_caption = (
-            f"{caption}\n\n" if caption else ""
-        ) + f"📦 {part_name}\nPart {part_number}/{part_count}"
-
-        sent = await safe_call(
-            bot.send_document,
-            message.chat.id,
-            part_path,
-            caption=part_caption[:1024],
-            progress=progress,
-            progress_args=[status_message, "up"],
-            reply_to_message_id=message.id,
-        )
-        if sent and target is not None and target != message.chat.id:
-            await safe_call(bot.copy_message, target, sent.chat.id, sent.id)
-
-        print(
-            f"Uploaded split part {part_number}/{part_count} "
-            f"({part_size / (1024 ** 2):.1f} MiB): {part_name}"
-        )
-        os.remove(part_path)
-        part_path = None
-
-    # WZGram stream_media(offset=...) resumes at a chunk offset. Keep the
-    # chunk counter separate from byte counts so a dropped connection can
-    # continue without downloading already-written data again.
-    chunk_offset = 0
-    retry_count = 0
-    max_stream_retries = 10
-
-    try:
-        while bytes_received < file_size:
-            stream = acc.stream_media(source_message, offset=chunk_offset)
-            iterator = aiter(stream)
-            got_chunk = False
-            interrupted = False
-
-            while True:
-                try:
-                    chunk = await iterator.__anext__()
-                except StopAsyncIteration:
-                    break
-                except Exception as error:
-                    error_name = type(error).__name__.lower()
-                    is_flood = "floodwait" in error_name or "floodpremiumwait" in error_name
-                    if not is_flood and not _is_connection_error(error):
-                        raise
-                    if retry_count >= max_stream_retries:
-                        raise RuntimeError(
-                            f"Media stream failed after {max_stream_retries} resume attempts: {error!r}"
-                        ) from error
-                    retry_count += 1
-                    interrupted = True
-                    if is_flood:
-                        delay = max(1, _flood_wait_seconds(error) + 1)
-                    else:
-                        delay = min(2 ** retry_count, 30)
-                    print(
-                        f"Media stream interrupted at chunk {chunk_offset}; "
-                        f"resuming in {delay}s ({retry_count}/{max_stream_retries}): {error!r}"
-                    )
-                    await asyncio.sleep(delay)
-                    break
-
-                got_chunk = True
-                view = memoryview(chunk)
-                while view:
-                    if part_path is None:
-                        part_name = f"{original_name}.part{part_number:03d}"
-                        part_path = os.path.join("/tmp", part_name)
-                        await safe_call(
-                            bot.edit_message_text,
-                            status_message.chat.id,
-                            status_message.id,
-                            f"📥 **DOWNLOADING PART {part_number}/{part_count}**\n"
-                            f"Preparing downloadable document part…",
-                        )
-
-                    available = part_limit - part_size
-                    piece = view[:available]
-                    with open(part_path, "ab") as part_file:
-                        part_file.write(piece)
-                    written = len(piece)
-                    part_size += written
-                    bytes_received += written
-                    view = view[written:]
-
-                    await progress(
-                        bytes_received, file_size, status_message, "down"
-                    )
-
-                    if part_size >= part_limit:
-                        await upload_current_part()
-                        part_number += 1
-                        part_size = 0
-
-                # Increment only after this chunk has been fully written.
-                chunk_offset += 1
-                retry_count = 0
-
-            if bytes_received >= file_size:
-                break
-            if interrupted:
-                # The exception handler already applied the retry delay.
-                continue
-
-            # A clean end before the advertised size is also treated as a
-            # temporary interruption. Resume from the next unread chunk.
-            if not got_chunk or bytes_received < file_size:
-                if retry_count >= max_stream_retries:
-                    raise IOError(
-                        f"Telegram stream stopped early after {bytes_received} "
-                        f"of {file_size} bytes and {max_stream_retries} retries."
-                    )
-                retry_count += 1
-                delay = min(2 ** retry_count, 30)
-                print(
-                    f"Telegram stream ended at {bytes_received}/{file_size} bytes; "
-                    f"resuming from chunk {chunk_offset} in {delay}s "
-                    f"({retry_count}/{max_stream_retries})."
-                )
-                await asyncio.sleep(delay)
-
-        if part_size:
-            await upload_current_part()
-
-        if bytes_received != file_size:
-            raise IOError(
-                f"Telegram stream ended early: received {bytes_received} "
-                f"of {file_size} bytes."
-            )
-
-    finally:
-        try:
-            if part_path and os.path.exists(part_path):
-                os.remove(part_path)
-        except OSError as error:
-            print(f"Could not remove temporary split part: {error!r}")
-
 
 def _load_target_config():
     global TARGET_CHAT_ID, AUTO_UPLOAD
@@ -361,9 +190,13 @@ async def _send_copy_to_destinations(
 # Async progress callback. WZGram supports async progress callbacks.
 _PROGRESS_WRITE_INTERVAL = 1.0
 _progress_last_edit = {}
+_status_cancel_keys = {}
 
 
 async def progress(current, total, status_message, transfer_type):
+    request_key = _status_cancel_keys.get((status_message.chat.id, status_message.id))
+    if request_key and _cancel_flags.get(request_key):
+        raise JobCancelled("Cancelled by user")
     if not total or total <= 0:
         return
 
@@ -431,55 +264,20 @@ USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 
 
 @bot.on_message(filters.command(["start"]))
 async def send_start(client, message):
-    """Show a short animated intro, then reveal the full welcome screen."""
     mention = message.from_user.mention if message.from_user else "there"
-
-    # Telegram has no CSS-style page transitions, so animate one message
-    # with a few lightweight edits instead of sending multiple messages.
-    intro = await safe_call(
+    await safe_call(
         bot.send_message,
         message.chat.id,
-        "<b>✨ WZGram</b>\n<code>▰▱▱▱▱▱▱▱▱▱</code>  <i>Starting...</i>",
-        reply_to_message_id=message.id,
-    )
-
-    transition_frames = (
-        "<b>✨ WZGram</b>\n<code>▰▰▱▱▱▱▱▱▱▱</code>  <i>Initializing...</i>",
-        "<b>⚡ WZGram</b>\n<code>▰▰▰▰▰▱▱▱▱▱</code>  <i>Preparing services...</i>",
-        "<b>🚀 WZGram</b>\n<code>▰▰▰▰▰▰▰▰▰▰</code>  <i>Ready!</i>",
-    )
-    for frame in transition_frames:
-        await asyncio.sleep(0.35)
-        try:
-            await safe_call(
-                bot.edit_message_text,
-                intro.chat.id,
-                intro.id,
-                frame,
+        f"**♻️ 𝙷𝚒** **{mention}**, "
+        f"**𝐈 𝐚𝐦 𝐒𝐚𝐯𝐞 𝐑𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐁𝐨𝐭, 𝐈 𝐜𝐚𝐧 𝐬𝐞𝐧𝐝 𝐲𝐨𝐮 "
+        f"𝐫𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐜𝐨𝐧𝐭𝐞𝐧𝐭 𝐛𝐲 𝐢𝐭'𝐬 𝐩𝐨𝐬𝐭 𝐥𝐢𝐧𝐤**\n\n{USAGE}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫",
+                url="tg://openmessage?user_id=7771180127",
             )
-        except Exception as error:
-            # A missed animation frame should never prevent the bot opening.
-            print(f"Welcome transition edit skipped: {error!r}")
-            break
-
-    welcome_text = (
-        f"<b>♻️ 𝙷𝚒 {mention}!</b>\n\n"
-        "<b>𝐖𝐞𝐥𝐜𝐨𝐦𝐞 𝐭𝐨 𝐖𝐙𝐆𝐫𝐚𝐦</b>\n"
-        "<i>Your smart restricted-content saver.</i>\n\n"
-        f"{USAGE}"
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫",
-            url="tg://openmessage?user_id=7771180127",
-        )
-    ]])
-    await safe_call(
-        bot.edit_message_text,
-        intro.chat.id,
-        intro.id,
-        welcome_text,
-        reply_markup=keyboard,
+        ]]),
+        reply_to_message_id=message.id,
     )
 
 
@@ -582,11 +380,14 @@ _job_lock = asyncio.Lock()
 async def save(client, message):
     """Process incoming links one job at a time."""
     async with _job_lock:
+        request_key = (message.chat.id, message.id)
+        _cancel_flags[request_key] = False
         try:
             await _process_message(client, message)
+        except JobCancelled:
+            await safe_call(bot.send_message, message.chat.id, "🛑 **Job cancelled.**", reply_to_message_id=message.id)
         except Exception as error:
             print(f"Task failed: {error!r}")
-            # Do not send the unwanted no-downloadable-media notification.
             if not _is_no_downloadable_media_error(error):
                 try:
                     await safe_call(
@@ -597,6 +398,32 @@ async def save(client, message):
                     )
                 except Exception as send_error:
                     print(f"Could not report task error: {send_error!r}")
+        finally:
+            _cancel_flags.pop(request_key, None)
+            for status_key, mapped_request in list(_status_cancel_keys.items()):
+                if mapped_request == request_key:
+                    _status_cancel_keys.pop(status_key, None)
+
+
+@bot.on_callback_query(filters.regex(r"^cancel_job:"))
+async def cancel_job_callback(client, callback_query):
+    try:
+        request_id = int(callback_query.data.split(":", 1)[1])
+        key = (callback_query.message.chat.id, request_id)
+        if not OWNER_ID or callback_query.from_user.id != OWNER_ID:
+            await callback_query.answer("Only the bot owner can cancel this job.", show_alert=True)
+            return
+        if key not in _cancel_flags:
+            await callback_query.answer("This job is no longer active.", show_alert=True)
+            return
+        _cancel_flags[key] = True
+        await callback_query.answer("Cancellation requested…")
+    except Exception as error:
+        print(f"Cancel callback error: {error!r}")
+        try:
+            await callback_query.answer("Could not cancel this job.", show_alert=True)
+        except Exception:
+            pass
 
 
 async def _process_message(client, message):
@@ -700,6 +527,8 @@ async def _process_message(client, message):
                     except Exception as fallback_error:
                         print(f"Post {msgid}: user-session fallback failed: {fallback_error!r}")
 
+        except JobCancelled:
+            raise
         except Exception as post_error:
             print(f"Post {msgid} failed; continuing: {post_error!r}")
 
@@ -737,25 +566,18 @@ async def handle_private(message, chatid, msgid):
         message.chat.id,
         "**Loading 🔄**",
         reply_to_message_id=message.id,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🛑 Cancel", callback_data=f"cancel_job:{message.id}"
+        )]]),
     )
+    request_key = (message.chat.id, message.id)
+    _status_cancel_keys[(status_message.chat.id, status_message.id)] = request_key
     down_file = f"{message.chat.id}_{message.id}_downstatus.txt"
     up_file = f"{message.chat.id}_{message.id}_upstatus.txt"
     downloaded_file = None
     thumb = None
 
     try:
-        media_obj = getattr(msg, msg_type.lower(), None)
-        media_size = int(getattr(media_obj, "file_size", 0) or 0)
-        if (
-            msg_type in ("Document", "Video")
-            and media_obj is not None
-            and media_size > SPLIT_PART_SIZE
-        ):
-            await _stream_upload_as_document_parts(
-                message, msg, status_message, msg.caption or "", media_obj
-            )
-            return
-
         try:
             downloaded_file = await safe_read_call(
                 acc.download_media,
